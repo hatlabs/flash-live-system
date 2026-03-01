@@ -213,6 +213,13 @@ if [ -n "$custom_password" ] && [ -z "$custom_user" ]; then
   echo "Error: password requires user" >&2
   exit 1
 fi
+# Reject values that could break heredoc delimiters in the generated firstrun.sh
+for _val in "$wifi_ssid" "$wifi_password"; do
+  if [[ "$_val" == *"__FLASH_"* ]]; then
+    echo "Error: WiFi credentials must not contain '__FLASH_'" >&2
+    exit 1
+  fi
+done
 
 # If user given without explicit ssh-key, auto-detect local SSH public keys
 if [ -n "$custom_user" ] && [ ${#custom_ssh_keys[@]} -eq 0 ]; then
@@ -238,85 +245,131 @@ if [ -n "$custom_hostname" ] || [ -n "$custom_user" ] || [ -n "$wifi_ssid" ]; th
   has_customization=true
 fi
 
-# --- Generate first-boot payloads ---
-# Follows the cloudinit-rpi format used by RPi Imager 2.x:
-# - user-data: cloud-init YAML with users: block, hostname, ssh_pwauth
-# - network-config: netplan YAML with eth0 + optional wlan0
+# --- Generate firstrun.sh script ---
+# Uses systemd.run kernel parameter (same mechanism as RPi Imager) to execute
+# a shell script on first boot. No cloud-init dependency.
 
-custom_user_data=""
-custom_network_config=""
+custom_firstrun=""
 
-# Build user-data YAML matching RPi Imager's cloudinit-rpi format
-ud_lines=()
-ud_lines+=("#cloud-config")
-
-if [ -n "$custom_hostname" ]; then
-  ud_lines+=("hostname: $custom_hostname")
-  ud_lines+=("manage_etc_hosts: true")
-fi
-
-if [ -n "$custom_user" ]; then
-  # Read SSH public keys
+if [ "$has_customization" = true ]; then
+  # Read SSH public keys upfront (need access to local filesystem)
   ssh_key_lines=()
-  for keyfile in "${custom_ssh_keys[@]}"; do
-    if [ ! -f "$keyfile" ]; then
-      echo "Error: SSH key file not found: $keyfile" >&2
-      exit 1
-    fi
-    ssh_key_lines+=("$(head -1 "$keyfile")")
-  done
-
-  ud_lines+=("users:")
-  ud_lines+=("  - name: $custom_user")
-  ud_lines+=("    groups: users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo")
-  ud_lines+=("    shell: /bin/bash")
-  ud_lines+=("    sudo: ALL=(ALL) NOPASSWD:ALL")
-  if [ -n "$password_hash" ]; then
-    ud_lines+=("    lock_passwd: false")
-    ud_lines+=("    passwd: $password_hash")
-  fi
-  if [ ${#ssh_key_lines[@]} -gt 0 ]; then
-    ud_lines+=("    ssh_authorized_keys:")
-    for key in "${ssh_key_lines[@]}"; do
-      ud_lines+=("      - $key")
+  if [ -n "$custom_user" ]; then
+    for keyfile in "${custom_ssh_keys[@]}"; do
+      if [ ! -f "$keyfile" ]; then
+        echo "Error: SSH key file not found: $keyfile" >&2
+        exit 1
+      fi
+      _key_line="$(head -1 "$keyfile")"
+      if [[ "$_key_line" == *"__FLASH_"* ]]; then
+        echo "Error: SSH key contains reserved delimiter '__FLASH_': $keyfile" >&2
+        exit 1
+      fi
+      ssh_key_lines+=("$_key_line")
     done
   fi
-  ud_lines+=("enable_ssh: true")
-  ud_lines+=("ssh_pwauth: true")
-fi
 
-# Only produce user-data if there's more than just the #cloud-config header
-if [ ${#ud_lines[@]} -gt 1 ]; then
-  custom_user_data=$(printf '%s\n' "${ud_lines[@]}")
-  # NoCloud datasource requires meta-data to exist (even if minimal)
-  custom_meta_data="instance-id: flash-live-system-$(date +%s)"
-fi
+  # Build firstrun.sh script
+  fr_lines=()
+  fr_lines+=("#!/bin/sh")
+  fr_lines+=("set +e")
+  fr_lines+=("")
 
-if [ -n "$wifi_ssid" ]; then
-  # Compute WPA PSK from passphrase + SSID (avoids plaintext password on disk)
-  _require python3
-  wifi_psk=$(python3 -c "
-import hashlib, sys
-psk = hashlib.pbkdf2_hmac('sha1', sys.argv[1].encode(), sys.argv[2].encode(), 4096, 32)
-print(psk.hex())
-" "$wifi_password" "$wifi_ssid")
+  if [ -n "$custom_hostname" ]; then
+    fr_lines+=("# Set hostname")
+    fr_lines+=("CURRENT_HOSTNAME=\$(tr -d '[:space:]' < /etc/hostname)")
+    fr_lines+=("echo '$custom_hostname' > /etc/hostname")
+    fr_lines+=("sed -i \"s/127\\.0\\.1\\.1.*\$CURRENT_HOSTNAME/127.0.1.1\\t$custom_hostname/g\" /etc/hosts")
+    fr_lines+=("")
+  fi
 
-  # Match RPi Imager's network-config format exactly
-  custom_network_config="network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-      dhcp6: true
-      optional: true
-  wifis:
-    wlan0:
-      dhcp4: true
-      regulatory-domain: \"$wifi_country\"
-      access-points:
-        \"$wifi_ssid\":
-          password: \"$wifi_psk\"
-      optional: true"
+  if [ -n "$custom_user" ]; then
+    fr_lines+=("# Rename default user (UID 1000) to target username")
+    fr_lines+=("FIRSTUSER=\$(getent passwd 1000 | cut -d: -f1)")
+    fr_lines+=("FIRSTUSERHOME=\$(getent passwd 1000 | cut -d: -f6)")
+    fr_lines+=("if [ -n \"\$FIRSTUSER\" ] && [ \"\$FIRSTUSER\" != '$custom_user' ]; then")
+    fr_lines+=("  if ! usermod -l '$custom_user' \"\$FIRSTUSER\"; then")
+    fr_lines+=("    echo 'firstrun: WARNING: failed to rename user, continuing with default' >&2")
+    fr_lines+=("  elif ! usermod -d '/home/$custom_user' -m '$custom_user'; then")
+    fr_lines+=("    echo 'firstrun: WARNING: failed to move home directory' >&2")
+    fr_lines+=("  else")
+    fr_lines+=("    groupmod -n '$custom_user' \"\$FIRSTUSER\"")
+    fr_lines+=("    # Update sudoers to match renamed user")
+    fr_lines+=("    for f in /etc/sudoers.d/*; do")
+    fr_lines+=("      [ -f \"\$f\" ] && sed -i \"s/^\$FIRSTUSER /$custom_user /\" \"\$f\"")
+    fr_lines+=("    done")
+    fr_lines+=("    FIRSTUSERHOME='/home/$custom_user'")
+    fr_lines+=("  fi")
+    fr_lines+=("elif [ -z \"\$FIRSTUSER\" ]; then")
+    fr_lines+=("  useradd -m -G users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo -s /bin/bash '$custom_user'")
+    fr_lines+=("  FIRSTUSERHOME='/home/$custom_user'")
+    fr_lines+=("fi")
+    fr_lines+=("")
+
+    if [ -n "$password_hash" ]; then
+      fr_lines+=("# Set password")
+      fr_lines+=("echo '$custom_user:$password_hash' | chpasswd -e")
+      fr_lines+=("")
+    fi
+
+    if [ ${#ssh_key_lines[@]} -gt 0 ]; then
+      fr_lines+=("# Install SSH keys")
+      fr_lines+=("install -o '$custom_user' -g '$custom_user' -m 700 -d \"\$FIRSTUSERHOME/.ssh\"")
+      # Write all keys into a single heredoc
+      fr_lines+=("cat > \"\$FIRSTUSERHOME/.ssh/authorized_keys\" <<'__FLASH_SSH_KEYS__'")
+      for key in "${ssh_key_lines[@]}"; do
+        fr_lines+=("$key")
+      done
+      fr_lines+=("__FLASH_SSH_KEYS__")
+      fr_lines+=("chown '$custom_user:$custom_user' \"\$FIRSTUSERHOME/.ssh/authorized_keys\"")
+      fr_lines+=("chmod 600 \"\$FIRSTUSERHOME/.ssh/authorized_keys\"")
+      fr_lines+=("")
+    fi
+
+    fr_lines+=("# Enable SSH")
+    if [ ${#ssh_key_lines[@]} -gt 0 ] && [ -z "$password_hash" ]; then
+      fr_lines+=("echo 'PasswordAuthentication no' >>/etc/ssh/sshd_config")
+    fi
+    fr_lines+=("systemctl enable ssh")
+    fr_lines+=("")
+  fi
+
+  if [ -n "$wifi_ssid" ]; then
+    fr_lines+=("# Configure WiFi via NetworkManager connection file")
+    fr_lines+=("cat > '/etc/NetworkManager/system-connections/firstrun-wifi.nmconnection' <<'__FLASH_WIFI_CONF__'")
+    fr_lines+=("[connection]")
+    fr_lines+=("id=firstrun-wifi")
+    fr_lines+=("type=wifi")
+    fr_lines+=("autoconnect=true")
+    fr_lines+=("")
+    fr_lines+=("[wifi]")
+    fr_lines+=("mode=infrastructure")
+    fr_lines+=("ssid=$wifi_ssid")
+    fr_lines+=("")
+    fr_lines+=("[wifi-security]")
+    fr_lines+=("key-mgmt=wpa-psk")
+    fr_lines+=("psk=$wifi_password")
+    fr_lines+=("")
+    fr_lines+=("[ipv4]")
+    fr_lines+=("method=auto")
+    fr_lines+=("")
+    fr_lines+=("[ipv6]")
+    fr_lines+=("method=auto")
+    fr_lines+=("__FLASH_WIFI_CONF__")
+    fr_lines+=("chmod 600 '/etc/NetworkManager/system-connections/firstrun-wifi.nmconnection'")
+    fr_lines+=("")
+  fi
+
+  # Self-cleanup: remove script and cmdline.txt params
+  fr_lines+=("# Clean up — remove firstrun.sh and systemd.run params from cmdline.txt")
+  fr_lines+=("rm -f /boot/firmware/firstrun.sh")
+  fr_lines+=("sed -i 's| systemd.run=/boot/firmware/firstrun.sh||' /boot/firmware/cmdline.txt")
+  fr_lines+=("sed -i 's| systemd.run_success_action=reboot||' /boot/firmware/cmdline.txt")
+  fr_lines+=("sed -i 's| systemd.unit=kernel-command-line.target||' /boot/firmware/cmdline.txt")
+  fr_lines+=("")
+  fr_lines+=("exit 0")
+
+  custom_firstrun=$(printf '%s\n' "${fr_lines[@]}")
 fi
 
 # Mode-specific prerequisites
@@ -556,12 +609,8 @@ run_on_target "/dev/shm/busybox --help >/dev/null 2>&1" \
 if [ "$has_customization" = true ]; then
   echo ""
   echo "Transferring customization payloads..."
-  if [ -n "$custom_user_data" ]; then
-    echo "$custom_user_data" | pipe_to_target "cat > /dev/shm/custom-user-data"
-    echo "$custom_meta_data" | pipe_to_target "cat > /dev/shm/custom-meta-data"
-  fi
-  if [ -n "$custom_network_config" ]; then
-    echo "$custom_network_config" | pipe_to_target "cat > /dev/shm/custom-network-config"
+  echo "$custom_firstrun" | pipe_to_target "cat > /dev/shm/custom-firstrun.sh"
+  if [ -n "$wifi_ssid" ] && [ -n "$wifi_country" ]; then
     echo "$wifi_country" | pipe_to_target "cat > /dev/shm/custom-wifi-country"
   fi
 
@@ -575,7 +624,7 @@ if [ "$has_customization" = true ]; then
   pipe_to_target "cat > /dev/shm/apply-customization.sh" <<'CUSTOMIZATION_EOF'
 # Sourced script — no shebang. Expects $BUSYBOX and $TARGET_DEV from caller.
 
-if [ ! -f /dev/shm/custom-user-data ] && [ ! -f /dev/shm/custom-network-config ]; then
+if [ ! -f /dev/shm/custom-firstrun.sh ]; then
   return 0
 fi
 
@@ -606,17 +655,26 @@ LOOP_DEV=$("$BUSYBOX" losetup -f)
 
 "$BUSYBOX" mkdir -p /dev/shm/bootmnt
 if "$BUSYBOX" mount -t vfat "$LOOP_DEV" /dev/shm/bootmnt; then
-  [ -f /dev/shm/custom-user-data ] && \
-    "$BUSYBOX" cp /dev/shm/custom-user-data /dev/shm/bootmnt/user-data
-  [ -f /dev/shm/custom-meta-data ] && \
-    "$BUSYBOX" cp /dev/shm/custom-meta-data /dev/shm/bootmnt/meta-data
-  [ -f /dev/shm/custom-network-config ] && \
-    "$BUSYBOX" cp /dev/shm/custom-network-config /dev/shm/bootmnt/network-config
+  # Place firstrun.sh on boot partition
+  "$BUSYBOX" cp /dev/shm/custom-firstrun.sh /dev/shm/bootmnt/firstrun.sh
+  "$BUSYBOX" chmod +x /dev/shm/bootmnt/firstrun.sh
+
+  # Append systemd.run params to cmdline.txt to trigger firstrun.sh on first boot
+  if [ -f /dev/shm/bootmnt/cmdline.txt ]; then
+    # Remove any trailing newline, append params, add newline back
+    CMDLINE=$("$BUSYBOX" cat /dev/shm/bootmnt/cmdline.txt | "$BUSYBOX" tr -d '\n')
+    echo "${CMDLINE} systemd.run=/boot/firmware/firstrun.sh systemd.run_success_action=reboot systemd.unit=kernel-command-line.target" \
+      > /dev/shm/bootmnt/cmdline.txt
+  else
+    echo "apply-customization: WARNING: cmdline.txt not found on boot partition"
+  fi
+
   # Update regulatory domain in cmdline.txt to match WiFi country
   if [ -f /dev/shm/custom-wifi-country ] && [ -f /dev/shm/bootmnt/cmdline.txt ]; then
     REGDOM=$("$BUSYBOX" cat /dev/shm/custom-wifi-country | "$BUSYBOX" tr -d '[:space:]')
     "$BUSYBOX" sed -i "s/cfg80211.ieee80211_regdom=[A-Z]*/cfg80211.ieee80211_regdom=$REGDOM/" /dev/shm/bootmnt/cmdline.txt
   fi
+
   # umount flushes FAT32 data. No explicit sync — a global sync would risk
   # writing back old rootfs dirty pages over the new image.
   "$BUSYBOX" umount /dev/shm/bootmnt
@@ -643,12 +701,14 @@ deploy_ramfs_helper() {
 
 # Phase 1 — runs under /bin/bash from rootfs (safe: dd hasn't started yet).
 # Re-exec under busybox sh from tmpfs so that NOTHING running after dd
-# depends on rootfs pages. Busybox is already on /dev/shm (deployed by
-# the host script before transfer).
+# depends on rootfs pages. Output is piped through tee so it appears on
+# both /dev/console (physical display) and /dev/shm/flash-helper.log.
 
 if [ -z "$_FLASH_REEXEC" ]; then
   export _FLASH_REEXEC=1
-  exec /dev/shm/busybox sh "$0" "$@"
+  exec /dev/shm/busybox sh -c \
+    '/dev/shm/busybox sh "$0" "$@" 2>&1 | /dev/shm/busybox tee /dev/shm/flash-helper.log > /dev/console' \
+    "$0" "$@"
 fi
 
 # Phase 2 — runs under busybox sh from tmpfs. No rootfs dependencies.
@@ -661,8 +721,15 @@ BUSYBOX=/dev/shm/busybox
 
 trap '"$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }' EXIT
 
+# Emergency remount all filesystems read-only before dd. This stops ext4
+# journaling (jbd2) and all filesystem writes, preventing the old rootfs
+# from writing back over the new image during or after dd.
+"$BUSYBOX" sync
+echo u > /proc/sysrq-trigger 2>/dev/null || true
+"$BUSYBOX" sleep 1
+
 echo "flash-helper: decompressing and writing $IMAGE_PATH -> $TARGET_DEV"
-"$BUSYBOX" "$DECOMPRESS_CMD" "$IMAGE_PATH" | "$BUSYBOX" dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
+"$BUSYBOX" "$DECOMPRESS_CMD" "$IMAGE_PATH" | "$BUSYBOX" dd of="$TARGET_DEV" bs=4M conv=fsync 2>/dev/shm/dd-status
 echo "flash-helper: dd complete:"
 "$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
 
@@ -673,6 +740,11 @@ if [ -f /dev/shm/apply-customization.sh ]; then
   ( . /dev/shm/apply-customization.sh ) \
     || echo "flash-helper: WARNING: customization failed, continuing to reboot"
 fi
+
+# Flush block device write cache before reboot. reboot -f skips global sync
+# (intentionally — old rootfs cache must NOT write back over the new image),
+# but the new image's writes must reach the physical device.
+"$BUSYBOX" sync "$TARGET_DEV" 2>/dev/null || "$BUSYBOX" blockdev --flushbufs "$TARGET_DEV" 2>/dev/null || true
 
 # EXIT trap handles reboot -f (skips sync so old rootfs cache doesn't
 # write back over the new image).
@@ -710,7 +782,7 @@ flash_ramfs() {
   deploy_ramfs_helper
 
   echo "Launching flash helper on target..."
-  ssh -n "$remote_host" "sudo setsid /dev/shm/flash-helper.sh '$shm_image' '$root_dev' '$decompress_cmd' </dev/null >/dev/shm/flash-helper.log 2>&1 &"
+  ssh -n "$remote_host" "sudo setsid /dev/shm/flash-helper.sh '$shm_image' '$root_dev' '$decompress_cmd' </dev/null &"
 
   echo ""
   echo "Image is being flashed on the target device."
@@ -740,13 +812,20 @@ if [ -z "$_FLASH_REEXEC" ]; then
 fi
 
 # Phase 2 — runs under busybox sh from tmpfs. No rootfs dependencies.
+set -eo pipefail
+
 TARGET_DEV="$1"
 BUSYBOX=/dev/shm/busybox
 
 trap '"$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }' EXIT
 
+# Emergency remount all filesystems read-only before dd.
+"$BUSYBOX" sync
+echo u > /proc/sysrq-trigger 2>/dev/null || true
+"$BUSYBOX" sleep 1
+
 echo "flash-helper: writing stdin -> $TARGET_DEV"
-"$BUSYBOX" dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
+"$BUSYBOX" dd of="$TARGET_DEV" bs=4M conv=fsync 2>/dev/shm/dd-status
 "$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
 echo "flash-helper: dd complete"
 
@@ -754,6 +833,9 @@ if [ -f /dev/shm/apply-customization.sh ]; then
   ( . /dev/shm/apply-customization.sh ) \
     || echo "flash-helper: WARNING: customization failed, continuing to reboot"
 fi
+
+# Flush block device before reboot
+"$BUSYBOX" sync "$TARGET_DEV" 2>/dev/null || "$BUSYBOX" blockdev --flushbufs "$TARGET_DEV" 2>/dev/null || true
 
 echo "flash-helper: rebooting..."
 HELPER_EOF
@@ -868,8 +950,13 @@ BUSYBOX=/dev/shm/busybox
 
 trap '"$BUSYBOX" reboot -f 2>/dev/null || { echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger; }' EXIT
 
+# Emergency remount all filesystems read-only before dd.
+"$BUSYBOX" sync
+echo u > /proc/sysrq-trigger 2>/dev/null || true
+"$BUSYBOX" sleep 1
+
 echo "flash-helper: decompressing and writing $IMAGE -> $TARGET_DEV"
-"$BUSYBOX" "$DECOMPRESS_CMD" "$IMAGE" | "$BUSYBOX" dd of="$TARGET_DEV" bs=4M 2>/dev/shm/dd-status
+"$BUSYBOX" "$DECOMPRESS_CMD" "$IMAGE" | "$BUSYBOX" dd of="$TARGET_DEV" bs=4M conv=fsync 2>/dev/shm/dd-status
 echo "flash-helper: dd complete:"
 "$BUSYBOX" cat /dev/shm/dd-status 2>/dev/null || true
 
@@ -877,6 +964,9 @@ if [ -f /dev/shm/apply-customization.sh ]; then
   ( . /dev/shm/apply-customization.sh ) \
     || echo "flash-helper: WARNING: customization failed, continuing to reboot"
 fi
+
+# Flush block device before reboot
+"$BUSYBOX" sync "$TARGET_DEV" 2>/dev/null || "$BUSYBOX" blockdev --flushbufs "$TARGET_DEV" 2>/dev/null || true
 
 echo "flash-helper: rebooting..."
 LOCAL_STREAM_EOF

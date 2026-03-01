@@ -16,7 +16,6 @@ The script embeds a statically-linked busybox (arm64), so the target device does
 - `ssh`, `scp`
 - `xzcat` / `zcat` (for compressed images, stream mode only)
 - `openssl` (only if using `password` in config)
-- `python3` (only if using `wifi-ssid` in config)
 
 **Remote mode (target device):**
 - SSH access
@@ -60,7 +59,7 @@ Supported image formats: `.img`, `.img.xz`, `.img.gz`
 
 ### First-boot customization
 
-Use `--config FILE` to pre-configure the flashed image via cloud-init. The config file uses simple `key=value` format — see `example.conf` for all available keys.
+Use `--config FILE` to pre-configure the flashed image on first boot. The config file uses simple `key=value` format — see `example.conf` for all available keys.
 
 ```bash
 # Flash with customization
@@ -87,7 +86,7 @@ wifi-country=FI
 | Key | Description |
 |---|---|
 | `hostname` | Set system hostname |
-| `user` | Set username (replaces default 'pi') |
+| `user` | Set username (renames the default UID 1000 user) |
 | `password` | Set user password (hashed locally with `openssl passwd -6`) |
 | `ssh-key` | SSH public key file (repeatable; defaults to `~/.ssh/*.pub` if `user` is set) |
 | `wifi-ssid` | WiFi network name (requires `wifi-password`) |
@@ -114,25 +113,9 @@ sudo flash-live-system --yes --yes-i-really-mean-it image.img.xz
 
 Using only `--yes` without `--yes-i-really-mean-it` is an error — both flags are required together to prevent accidental bypasses.
 
-After `dd` completes, the helper mounts the boot partition (FAT32, partition 1) and writes `user-data` and/or `network-config` files for cloud-init. If no config file is given, behavior is identical to a plain flash.
+After `dd` completes, the helper mounts the boot partition (FAT32, partition 1), places a `firstrun.sh` script, and appends `systemd.run` parameters to `cmdline.txt`. On first boot, systemd executes the script (which configures hostname, user, WiFi, etc.), then reboots into the fully configured system. No cloud-init dependency. If no config file is given, behavior is identical to a plain flash.
 
-**Important:** Customization assumes the new image has a FAT32 boot partition as partition 1. After `dd`, the helper parses the new partition table via `busybox fdisk` and loop-mounts at the correct offset, so the new image's partition layout does not need to match the old one. However, if the new image lacks a FAT32 boot partition, customization will fail (the flash itself still succeeds and the device reboots normally).
-
-#### Known issues with cloud-init on some images
-
-flash-live-system places `user-data` and `network-config` files on the boot partition and relabels it to `CIDATA` so that cloud-init discovers them via `blkid`. Whether cloud-init actually processes these files depends on the image's cloud-init configuration — flash-live-system has no control over the image's cloud-init behavior.
-
-**RPi OS trixie**: Stock Raspberry Pi OS trixie images ship with `99_raspberry-pi.cfg` containing `seedfrom: file:///boot/firmware`, which causes cloud-init to read seed data from the filesystem mount path instead of the `CIDATA` partition discovered via `blkid`. Because `/boot/firmware` may not be mounted when cloud-init runs, the `seedfrom` directive can race with the mount and produce unpredictable results — config may be applied partially or not at all. This is a known upstream issue ([RPi-Distro/rpi-cloud-init-mods#2](https://github.com/RPi-Distro/rpi-cloud-init-mods/issues/2), [canonical/cloud-init#6614](https://github.com/canonical/cloud-init/issues/6614)).
-
-**Workaround**: The upstream fix adds `RequiresMountsFor=/boot/firmware` to `cloud-init-main.service`, ensuring the mount is available before cloud-init runs. Users can apply this manually on a running system:
-
-```bash
-sudo mkdir -p /etc/systemd/system/cloud-init-main.service.d
-printf '[Unit]\nRequiresMountsFor=/boot/firmware\n' | \
-  sudo tee /etc/systemd/system/cloud-init-main.service.d/mount-bootfs.conf
-```
-
-**HaLOS images** are not affected — they do not use cloud-init for first-boot configuration.
+**Important:** Customization assumes the new image has a FAT32 boot partition as partition 1 with a `cmdline.txt` file. After `dd`, the helper parses the new partition table via `busybox fdisk` and loop-mounts at the correct offset, so the new image's partition layout does not need to match the old one. However, if the new image lacks a FAT32 boot partition, customization will fail (the flash itself still succeeds and the device reboots normally).
 
 ### Local mode (default)
 
@@ -189,7 +172,7 @@ Phase 0: Detect root block device
          Check customization prerequisites*
          Confirm with user
          Deploy embedded busybox to /dev/shm
-         Write cloud-init payloads to /dev/shm*
+         Write firstrun.sh payload to /dev/shm*
 Phase 1: cp image.img.xz → /dev/shm/image.img.xz
          Verify file size matches
 Phase 2: Stop services, sync
@@ -209,7 +192,7 @@ Phase 0: Detect root block device
          Check customization prerequisites*
          Confirm with user
          Deploy embedded busybox to /dev/shm
-         Write cloud-init payloads to /dev/shm*
+         Write firstrun.sh payload to /dev/shm*
 Phase 1: Safety check (image must be on different block device)
          Stop services, sync
 Phase 2: busybox decompress image | busybox dd → block device
@@ -228,7 +211,7 @@ Phase 0: SSH ──────────────────────�
          SSH ──────────────────────────── Check customization prerequisites*
          Confirm with user
          scp ──────────────────────────── Deploy embedded busybox
-         SSH ──────────────────────────── Transfer cloud-init payloads*
+         SSH ──────────────────────────── Transfer firstrun.sh payload*
 Phase 1: scp image.img.xz ─────────────── /dev/shm/image.img.xz
          SSH ──────────────────────────── Verify file size matches
 Phase 2: SSH ──────────────────────────── Stop services, sync
@@ -236,7 +219,7 @@ Phase 2: SSH ──────────────────────�
          SSH ──────────────────────────── Launch helper (detached)
                                           Helper: xzcat /dev/shm/image | dd
                                           Helper: loop-mount boot partition*
-                                          Helper: write cloud-init files*
+                                          Helper: write firstrun.sh + update cmdline.txt*
                                           Helper: reboot -f
 ```
 *Only when --config is provided.
@@ -250,12 +233,12 @@ Phase 0: SSH ──────────────────────�
          SSH ──────────────────────────── Check customization prerequisites*
          Confirm with user
          scp ──────────────────────────── Deploy embedded busybox
-         SSH ──────────────────────────── Transfer cloud-init payloads*
+         SSH ──────────────────────────── Transfer firstrun.sh payload*
 Phase 1: SSH ──────────────────────────── Deploy helper
          SSH ──────────────────────────── Stop services, sync
 Phase 2: xzcat | ssh "helper" ─────────── dd writes to block device
                                           Helper: loop-mount boot partition*
-                                          Helper: write cloud-init files*
+                                          Helper: write firstrun.sh + update cmdline.txt*
                                           Helper: reboot -f (via EXIT trap)
 ```
 *Only when --config is provided.

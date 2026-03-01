@@ -23,7 +23,7 @@ DIST_SCRIPT="$DIST_DIR/flash-live-system"
 
 REQUIRED_APPLETS=(
   sh dd xzcat zcat cat reboot fdisk losetup mount umount
-  sed awk grep head tr cp mkdir rm df
+  sed awk grep head tr cp mkdir rm df chmod
 )
 
 # Debian base image for extracting busybox-static (arm64)
