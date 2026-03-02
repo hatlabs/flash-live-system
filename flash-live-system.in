@@ -382,6 +382,19 @@ if [ "$has_customization" = true ]; then
   fi
 
   if [ -n "$wifi_ssid" ]; then
+    fr_lines+=("# Unblock WiFi — stock RPi OS images ship with WiFi soft-blocked")
+    fr_lines+=("rfkill unblock wifi")
+    fr_lines+=("for f in /var/lib/systemd/rfkill/*:wlan; do")
+    fr_lines+=("  [ -e \"\$f\" ] && echo 0 > \"\$f\"")
+    fr_lines+=("done")
+    fr_lines+=("")
+    fr_lines+=("# Set regulatory domain")
+    fr_lines+=("if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then")
+    fr_lines+=("  /usr/lib/raspberrypi-sys-mods/imager_custom set_wlan_country '$wifi_country'")
+    fr_lines+=("else")
+    fr_lines+=("  iw reg set '$wifi_country' 2>/dev/null || true")
+    fr_lines+=("fi")
+    fr_lines+=("")
     fr_lines+=("# Configure WiFi via NetworkManager connection file")
     fr_lines+=("cat > '/etc/NetworkManager/system-connections/firstrun-wifi.nmconnection' <<'__FLASH_WIFI_CONF__'")
     fr_lines+=("[connection]")
