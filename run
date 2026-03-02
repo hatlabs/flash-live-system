@@ -17,7 +17,7 @@ fi
 PROJECT_ROOT=$(pwd)
 readonly PROJECT_ROOT
 
-SOURCE_SCRIPT="$PROJECT_ROOT/flash-live-system"
+SOURCE_SCRIPT="$PROJECT_ROOT/flash-live-system.in"
 DIST_DIR="$PROJECT_ROOT/dist"
 DIST_SCRIPT="$DIST_DIR/flash-live-system"
 
