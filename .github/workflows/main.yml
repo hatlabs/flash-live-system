@@ -28,11 +28,16 @@ jobs:
       - name: Calculate revision
         id: revision
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          # Count existing tags matching v{VERSION}+*
-          COUNT=$(git tag -l "v${VERSION}+*" | wc -l | tr -d ' ')
+          # Revision = number of commits since VERSION was last changed.
+          # Each merge to main produces a unique count, avoiding tag collisions.
+          LAST_CHANGE=$(git log -1 --format=%H -- VERSION)
+          if [ -z "$LAST_CHANGE" ]; then
+            echo "ERROR: cannot find commit that last changed VERSION"
+            exit 1
+          fi
+          COUNT=$(git rev-list --count "${LAST_CHANGE}..HEAD")
           echo "revision=$COUNT" >> "$GITHUB_OUTPUT"
-          echo "Version: $VERSION, Revision: $COUNT"
+          echo "Version: ${{ steps.version.outputs.version }}, Revision: $COUNT"
 
       - name: Check if pre-release already exists
         id: check-prerelease
