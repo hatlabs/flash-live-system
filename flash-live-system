@@ -700,12 +700,15 @@ deploy_ramfs_helper() {
 #!/bin/bash
 
 # Phase 1 — runs under /bin/bash from rootfs (safe: dd hasn't started yet).
-# Re-exec under busybox sh from tmpfs so that NOTHING running after dd
+# Switch to a text console so output is visible on the physical display
+# (also serves as a clear visual signal that something drastic is happening).
+# Then re-exec under busybox sh from tmpfs so that NOTHING running after dd
 # depends on rootfs pages. Output is piped through tee so it appears on
 # both /dev/console (physical display) and /dev/shm/flash-helper.log.
 
 if [ -z "$_FLASH_REEXEC" ]; then
   export _FLASH_REEXEC=1
+  chvt 1 2>/dev/null || true
   exec /dev/shm/busybox sh -c \
     '/dev/shm/busybox sh "$0" "$@" 2>&1 | /dev/shm/busybox tee /dev/shm/flash-helper.log > /dev/console' \
     "$0" "$@"
