@@ -125,6 +125,25 @@ function build {
   rm -f "$_bb_tmp" "$_bb_b64_file"
 }
 
+function bumpversion {
+  #@ Bump version (patch|minor|major)
+  #@ Category: Version
+  local BUMP_TYPE="${1:-}"
+
+  if [[ -z "$BUMP_TYPE" ]] || [[ ! "$BUMP_TYPE" =~ ^(patch|minor|major)$ ]]; then
+    echo "Usage: ./run bumpversion [patch|minor|major]"
+    exit 1
+  fi
+
+  if ! command -v bumpversion &> /dev/null; then
+    echo "Error: bumpversion not installed. Install with: pip install bump2version"
+    exit 1
+  fi
+
+  echo "Bumping $BUMP_TYPE version..."
+  command bumpversion "$BUMP_TYPE"
+}
+
 function clean {
   #@ Remove dist/ directory
   #@ Category: Build
