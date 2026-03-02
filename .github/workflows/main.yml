@@ -101,6 +101,10 @@ jobs:
           gh release list --json tagName,isDraft --jq '.[] | select(.isDraft) | .tagName' | while read -r tag; do
             echo "Deleting old draft release: $tag"
             gh release delete "$tag" --yes 2>/dev/null || true
+            if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
+              echo "Deleting orphaned tag: $tag"
+              git push origin --delete "$tag" 2>/dev/null || true
+            fi
           done
 
       - name: Create draft stable release
@@ -111,8 +115,6 @@ jobs:
           REVISION: ${{ steps.revision.outputs.revision }}
         run: |
           TAG="v${VERSION}+${REVISION}"
-          git tag "$TAG"
-          git push origin "$TAG"
           {
             echo "## flash-live-system $TAG"
             echo ""
@@ -129,4 +131,5 @@ jobs:
           gh release create "$TAG" dist/flash-live-system \
             --title "$TAG" \
             --draft \
+            --target $(git rev-parse HEAD) \
             --notes-file /tmp/release-notes.md
