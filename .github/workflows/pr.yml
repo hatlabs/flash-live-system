@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Shellcheck source script
-        run: shellcheck flash-live-system
+        run: shellcheck flash-live-system.in
 
       - name: Shellcheck run script
         run: shellcheck run

@@ -176,9 +176,11 @@ Phase 1: cp image.img.xz → /dev/shm/image.img.xz
          Verify file size matches
 Phase 2: Stop services, sync
          Deploy helper
-         Helper: xzcat /dev/shm/image | dd
+         Helper: remount filesystems read-only (SysRq-u)
+         Helper: xzcat /dev/shm/image | dd (fsync)
          Helper: apply-customization.sh*
-         Helper: reboot -f
+         Helper: sync target block device
+         Helper: reboot -f (via EXIT trap)
 ```
 *Only when --config is provided.
 
@@ -194,9 +196,11 @@ Phase 0: Detect root block device
          Write firstrun.sh payload to /dev/shm*
 Phase 1: Safety check (image must be on different block device)
          Stop services, sync
-Phase 2: busybox decompress image | busybox dd → block device
-         apply-customization.sh*
-         reboot -f
+Phase 2: Helper: remount filesystems read-only (SysRq-u)
+         Helper: busybox decompress image | busybox dd (fsync)
+         Helper: apply-customization.sh*
+         Helper: sync target block device
+         Helper: reboot -f (via EXIT trap)
 ```
 *Only when --config is provided.
 
@@ -216,10 +220,13 @@ Phase 1: scp image.img.xz ─────────────── /dev/shm
 Phase 2: SSH ──────────────────────────── Stop services, sync
          SSH ──────────────────────────── Deploy helper
          SSH ──────────────────────────── Launch helper (detached)
-                                          Helper: xzcat /dev/shm/image | dd
-                                          Helper: loop-mount boot partition*
-                                          Helper: write firstrun.sh + update cmdline.txt*
-                                          Helper: reboot -f
+                                          Helper: switch to text console (chvt)
+                                          Helper: remount filesystems read-only (SysRq-u)
+                                          Helper: xzcat /dev/shm/image | dd (fsync)
+                                          Helper: apply-customization.sh*
+                                          Helper: sync target block device
+                                          Helper: reboot -f (via EXIT trap)
+                                          (output → /dev/console + log file)
 ```
 *Only when --config is provided.
 
@@ -235,9 +242,10 @@ Phase 0: SSH ──────────────────────�
          SSH ──────────────────────────── Transfer firstrun.sh payload*
 Phase 1: SSH ──────────────────────────── Deploy helper
          SSH ──────────────────────────── Stop services, sync
-Phase 2: xzcat | ssh "helper" ─────────── dd writes to block device
-                                          Helper: loop-mount boot partition*
-                                          Helper: write firstrun.sh + update cmdline.txt*
+Phase 2: xzcat | ssh "helper" ─────────── Helper: remount filesystems read-only (SysRq-u)
+                                          Helper: dd (fsync) writes to block device
+                                          Helper: apply-customization.sh*
+                                          Helper: sync target block device
                                           Helper: reboot -f (via EXIT trap)
 ```
 *Only when --config is provided.
@@ -246,9 +254,10 @@ Phase 2: xzcat | ssh "helper" ─────────── dd writes to blo
 
 - **Ramfs mode is default**: scp/cp provides a pre-flash integrity check (file size verification). If the transfer fails, no destructive action has happened — the device is fully recoverable.
 - **Stream mode uses SSH as transport** (remote): The decompressed image is piped directly through SSH (`xzcat | ssh host "dd ..."`). SSH handles flow control, buffering, and connection lifecycle correctly. When xzcat finishes, SSH sends EOF, dd gets EOF and exits. No nc/ncat needed.
-- **No pivot_root or unmount**: `dd` writes to the raw block device, bypassing the mounted filesystem. `reboot -f` skips sync so the old filesystem cache doesn't write back.
+- **No pivot_root or unmount**: `dd` writes to the raw block device, bypassing the mounted filesystem. Before dd, an emergency remount read-only (SysRq-u) stops ext4 journaling and filesystem writes. After dd, only the target block device is synced — `reboot -f` skips the global sync so old rootfs cache doesn't write back over the new image.
 - **Embedded static busybox**: The script embeds a statically-linked busybox binary (arm64, Debian). At runtime it's extracted to `/dev/shm` and used for all target-side operations (`dd`, `xzcat`, `reboot`, etc.). This eliminates shared library dependencies and the need for any tools on the target beyond SSH and basic Linux utilities.
-- **EXIT trap (stream mode)**: The helper uses `trap 'busybox reboot -f' EXIT` to ensure reboot happens even if the SSH session drops during or after the write.
+- **EXIT trap**: All modes use `trap 'busybox reboot -f' EXIT` to ensure reboot happens even if something fails unexpectedly (e.g., SSH session drops in stream mode).
+- **Console output (remote ramfs)**: The helper switches to a text console (`chvt 1`) and pipes all output through `tee` to both `/dev/console` and a log file, so flashing progress is visible on the device's physical display.
 - **Config file over flags**: Passwords stay in a file (not visible in `ps` or shell history), and settings are written once and reused across flashes.
 
 ## Choosing a mode
@@ -256,7 +265,7 @@ Phase 2: xzcat | ssh "helper" ─────────── dd writes to blo
 | | Local ramfs | Local stream | Remote ramfs (default) | Remote stream |
 |---|---|---|---|---|
 | **Safety** | Pre-flash integrity check | Requires image on separate disk | Pre-flash integrity check | Transfer failure = partial image |
-| **Progress** | cp progress (if terminal) | None (dd reports at end) | scp progress bar | None (dd reports at end) |
+| **Progress** | cp progress (if terminal) | None (dd reports at end) | scp progress bar + console output | None (dd reports at end) |
 | **RAM required** | Compressed image in /dev/shm | Minimal | Compressed image in /dev/shm | Minimal |
 | **Speed** | Fast | Fast (local I/O only) | Fast (local decompress + NVMe) | Network-bound |
 | **Needs SSH** | No | No | Yes | Yes |
