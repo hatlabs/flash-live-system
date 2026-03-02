@@ -233,11 +233,9 @@ if [ -n "$custom_user" ] && [ -z "$custom_password" ] && [ ${#custom_ssh_keys[@]
   echo "  Add password or ssh-key to your config file, or place public keys in ~/.ssh/*.pub" >&2
 fi
 
-# If password given, hash it locally
-password_hash=""
-if [ -n "$custom_password" ]; then
-  _require openssl
-  password_hash=$(printf '%s' "$custom_password" | openssl passwd -6 -stdin)
+if [ -n "$custom_password" ] && [[ "$custom_password" == *"__FLASH_"* ]]; then
+  echo "Error: password must not contain '__FLASH_'" >&2
+  exit 1
 fi
 
 has_customization=false
@@ -278,60 +276,99 @@ if [ "$has_customization" = true ]; then
   if [ -n "$custom_hostname" ]; then
     fr_lines+=("# Set hostname")
     fr_lines+=("CURRENT_HOSTNAME=\$(tr -d '[:space:]' < /etc/hostname)")
-    fr_lines+=("echo '$custom_hostname' > /etc/hostname")
-    fr_lines+=("sed -i \"s/127\\.0\\.1\\.1.*\$CURRENT_HOSTNAME/127.0.1.1\\t$custom_hostname/g\" /etc/hosts")
+    fr_lines+=("if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then")
+    fr_lines+=("  /usr/lib/raspberrypi-sys-mods/imager_custom set_hostname '$custom_hostname'")
+    fr_lines+=("else")
+    fr_lines+=("  echo '$custom_hostname' > /etc/hostname")
+    fr_lines+=("  sed -i \"s/127\\.0\\.1\\.1.*\$CURRENT_HOSTNAME/127.0.1.1\\t$custom_hostname/g\" /etc/hosts")
+    fr_lines+=("fi")
     fr_lines+=("")
   fi
 
   if [ -n "$custom_user" ]; then
-    fr_lines+=("# Rename default user (UID 1000) to target username")
     fr_lines+=("FIRSTUSER=\$(getent passwd 1000 | cut -d: -f1)")
     fr_lines+=("FIRSTUSERHOME=\$(getent passwd 1000 | cut -d: -f6)")
-    fr_lines+=("if [ -n \"\$FIRSTUSER\" ] && [ \"\$FIRSTUSER\" != '$custom_user' ]; then")
-    fr_lines+=("  if ! usermod -l '$custom_user' \"\$FIRSTUSER\"; then")
-    fr_lines+=("    echo 'firstrun: WARNING: failed to rename user, continuing with default' >&2")
-    fr_lines+=("  elif ! usermod -d '/home/$custom_user' -m '$custom_user'; then")
-    fr_lines+=("    echo 'firstrun: WARNING: failed to move home directory' >&2")
-    fr_lines+=("  else")
-    fr_lines+=("    groupmod -n '$custom_user' \"\$FIRSTUSER\"")
-    fr_lines+=("    # Update sudoers to match renamed user")
-    fr_lines+=("    for f in /etc/sudoers.d/*; do")
-    fr_lines+=("      [ -f \"\$f\" ] && sed -i \"s/^\$FIRSTUSER /$custom_user /\" \"\$f\"")
-    fr_lines+=("    done")
-    fr_lines+=("    FIRSTUSERHOME='/home/$custom_user'")
-    fr_lines+=("  fi")
-    fr_lines+=("elif [ -z \"\$FIRSTUSER\" ]; then")
-    fr_lines+=("  useradd -m -G users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo -s /bin/bash '$custom_user'")
-    fr_lines+=("  FIRSTUSERHOME='/home/$custom_user'")
-    fr_lines+=("fi")
     fr_lines+=("")
 
-    if [ -n "$password_hash" ]; then
-      fr_lines+=("# Set password")
-      fr_lines+=("echo '$custom_user:$password_hash' | chpasswd -e")
+    # Store password in a variable via heredoc (safe for special characters).
+    # Used by both the native userconf path and the manual fallback.
+    if [ -n "$custom_password" ]; then
+      fr_lines+=("_PW=\$(cat <<'__FLASH_PASSWORD__'")
+      fr_lines+=("$custom_password")
+      fr_lines+=("__FLASH_PASSWORD__")
+      fr_lines+=(")")
       fr_lines+=("")
     fi
 
+    # Use RPi OS native userconf tool when available. It handles user
+    # creation/rename AND marks the system as configured (suppressing the
+    # interactive setup wizard). Hash the password on the target with openssl.
+    fr_lines+=("# Configure user — use native RPi OS tool if available")
+    fr_lines+=("if [ -f /usr/lib/userconf-pi/userconf ]; then")
+    if [ -n "$custom_password" ]; then
+      fr_lines+=("  HASHED_PW=\$(printf '%s' \"\$_PW\" | openssl passwd -6 -stdin)")
+      fr_lines+=("  /usr/lib/userconf-pi/userconf '$custom_user' \"\$HASHED_PW\"")
+    else
+      fr_lines+=("  /usr/lib/userconf-pi/userconf '$custom_user' ''")
+    fi
+    fr_lines+=("else")
+    fr_lines+=("  # Manual fallback for non-RPi OS images")
+    fr_lines+=("  if [ -n \"\$FIRSTUSER\" ] && [ \"\$FIRSTUSER\" != '$custom_user' ]; then")
+    fr_lines+=("    if ! usermod -l '$custom_user' \"\$FIRSTUSER\"; then")
+    fr_lines+=("      echo 'firstrun: WARNING: failed to rename user, continuing with default' >&2")
+    fr_lines+=("    elif ! usermod -d '/home/$custom_user' -m '$custom_user'; then")
+    fr_lines+=("      echo 'firstrun: WARNING: failed to move home directory' >&2")
+    fr_lines+=("    else")
+    fr_lines+=("      groupmod -n '$custom_user' \"\$FIRSTUSER\"")
+    fr_lines+=("      for f in /etc/sudoers.d/*; do")
+    fr_lines+=("        [ -f \"\$f\" ] && sed -i \"s/^\$FIRSTUSER /$custom_user /\" \"\$f\"")
+    fr_lines+=("      done")
+    fr_lines+=("      FIRSTUSERHOME='/home/$custom_user'")
+    fr_lines+=("    fi")
+    fr_lines+=("  elif [ -z \"\$FIRSTUSER\" ]; then")
+    fr_lines+=("    useradd -m -G users,adm,dialout,audio,netdev,video,plugdev,cdrom,games,input,gpio,spi,i2c,render,sudo -s /bin/bash '$custom_user'")
+    fr_lines+=("    FIRSTUSERHOME='/home/$custom_user'")
+    fr_lines+=("  fi")
+    if [ -n "$custom_password" ]; then
+      fr_lines+=("  printf '%s:%s\\n' '$custom_user' \"\$_PW\" | chpasswd")
+    fi
+    fr_lines+=("fi")
+    fr_lines+=("")
+
     if [ ${#ssh_key_lines[@]} -gt 0 ]; then
       fr_lines+=("# Install SSH keys")
-      fr_lines+=("install -o '$custom_user' -g '$custom_user' -m 700 -d \"\$FIRSTUSERHOME/.ssh\"")
-      # Write all keys into a single heredoc
-      fr_lines+=("cat > \"\$FIRSTUSERHOME/.ssh/authorized_keys\" <<'__FLASH_SSH_KEYS__'")
+      fr_lines+=("FIRSTUSERHOME=\$(getent passwd '$custom_user' | cut -d: -f6)")
+      fr_lines+=("if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then")
+      key_args=""
+      for key in "${ssh_key_lines[@]}"; do
+        key_args+=" '$key'"
+      done
+      fr_lines+=("  /usr/lib/raspberrypi-sys-mods/imager_custom enable_ssh -k$key_args")
+      fr_lines+=("else")
+      fr_lines+=("  install -o '$custom_user' -g '$custom_user' -m 700 -d \"\$FIRSTUSERHOME/.ssh\"")
+      fr_lines+=("  cat > \"\$FIRSTUSERHOME/.ssh/authorized_keys\" <<'__FLASH_SSH_KEYS__'")
       for key in "${ssh_key_lines[@]}"; do
         fr_lines+=("$key")
       done
       fr_lines+=("__FLASH_SSH_KEYS__")
-      fr_lines+=("chown '$custom_user:$custom_user' \"\$FIRSTUSERHOME/.ssh/authorized_keys\"")
-      fr_lines+=("chmod 600 \"\$FIRSTUSERHOME/.ssh/authorized_keys\"")
+      fr_lines+=("  chown '$custom_user:$custom_user' \"\$FIRSTUSERHOME/.ssh/authorized_keys\"")
+      fr_lines+=("  chmod 600 \"\$FIRSTUSERHOME/.ssh/authorized_keys\"")
+      if [ -z "$custom_password" ]; then
+        fr_lines+=("  echo 'PasswordAuthentication no' >>/etc/ssh/sshd_config")
+      fi
+      fr_lines+=("  systemctl enable ssh")
+      fr_lines+=("fi")
+      fr_lines+=("")
+    elif [ -n "$custom_user" ]; then
+      # SSH keys not provided but user is set — still enable SSH
+      fr_lines+=("# Enable SSH")
+      fr_lines+=("if [ -f /usr/lib/raspberrypi-sys-mods/imager_custom ]; then")
+      fr_lines+=("  /usr/lib/raspberrypi-sys-mods/imager_custom enable_ssh")
+      fr_lines+=("else")
+      fr_lines+=("  systemctl enable ssh")
+      fr_lines+=("fi")
       fr_lines+=("")
     fi
-
-    fr_lines+=("# Enable SSH")
-    if [ ${#ssh_key_lines[@]} -gt 0 ] && [ -z "$password_hash" ]; then
-      fr_lines+=("echo 'PasswordAuthentication no' >>/etc/ssh/sshd_config")
-    fi
-    fr_lines+=("systemctl enable ssh")
-    fr_lines+=("")
   fi
 
   if [ -n "$wifi_ssid" ]; then
@@ -360,12 +397,20 @@ if [ "$has_customization" = true ]; then
     fr_lines+=("")
   fi
 
-  # Self-cleanup: remove script and cmdline.txt params
-  fr_lines+=("# Clean up — remove firstrun.sh and systemd.run params from cmdline.txt")
-  fr_lines+=("rm -f /boot/firmware/firstrun.sh")
-  fr_lines+=("sed -i 's| systemd.run=/boot/firmware/firstrun.sh||' /boot/firmware/cmdline.txt")
-  fr_lines+=("sed -i 's| systemd.run_success_action=reboot||' /boot/firmware/cmdline.txt")
-  fr_lines+=("sed -i 's| systemd.unit=kernel-command-line.target||' /boot/firmware/cmdline.txt")
+  # Self-cleanup: remove script and strip systemd.run params from cmdline.txt.
+  # Boot partition is at /boot/firmware (Trixie+) or /boot (Bookworm and older).
+  fr_lines+=("# Clean up")
+  fr_lines+=("if FWLOC=\$(/usr/lib/raspberrypi-sys-mods/get_fw_loc 2>/dev/null); then")
+  fr_lines+=("  :")
+  fr_lines+=("elif [ -d /boot/firmware ]; then")
+  fr_lines+=("  FWLOC=/boot/firmware")
+  fr_lines+=("else")
+  fr_lines+=("  FWLOC=/boot")
+  fr_lines+=("fi")
+  fr_lines+=("rm -f \"\$FWLOC/firstrun.sh\"")
+  fr_lines+=("sed -i 's| systemd.run=[^ ]*||g' \"\$FWLOC/cmdline.txt\"")
+  fr_lines+=("sed -i 's| systemd.run_success_action=[^ ]*||g' \"\$FWLOC/cmdline.txt\"")
+  fr_lines+=("sed -i 's| systemd.unit=[^ ]*||g' \"\$FWLOC/cmdline.txt\"")
   fr_lines+=("")
   fr_lines+=("exit 0")
 
@@ -659,11 +704,17 @@ if "$BUSYBOX" mount -t vfat "$LOOP_DEV" /dev/shm/bootmnt; then
   "$BUSYBOX" cp /dev/shm/custom-firstrun.sh /dev/shm/bootmnt/firstrun.sh
   "$BUSYBOX" chmod +x /dev/shm/bootmnt/firstrun.sh
 
-  # Append systemd.run params to cmdline.txt to trigger firstrun.sh on first boot
+  # Append systemd.run params to cmdline.txt to trigger firstrun.sh on first boot.
+  # Boot partition mount path differs by OS version: /boot/firmware (Trixie+) vs /boot (Bookworm).
+  # Detect via auto_initramfs in config.txt (Trixie+ indicator).
+  if "$BUSYBOX" grep -q 'auto_initramfs=1' /dev/shm/bootmnt/config.txt 2>/dev/null; then
+    FWPATH=/boot/firmware
+  else
+    FWPATH=/boot
+  fi
   if [ -f /dev/shm/bootmnt/cmdline.txt ]; then
-    # Remove any trailing newline, append params, add newline back
     CMDLINE=$("$BUSYBOX" cat /dev/shm/bootmnt/cmdline.txt | "$BUSYBOX" tr -d '\n')
-    echo "${CMDLINE} systemd.run=/boot/firmware/firstrun.sh systemd.run_success_action=reboot systemd.unit=kernel-command-line.target" \
+    echo "${CMDLINE} systemd.run=${FWPATH}/firstrun.sh systemd.run_success_action=reboot systemd.unit=kernel-command-line.target" \
       > /dev/shm/bootmnt/cmdline.txt
   else
     echo "apply-customization: WARNING: cmdline.txt not found on boot partition"

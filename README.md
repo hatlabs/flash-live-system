@@ -15,7 +15,6 @@ The script embeds a statically-linked busybox (arm64), so the target device does
 **Remote mode (dev machine):**
 - `ssh`, `scp`
 - `xzcat` / `zcat` (for compressed images, stream mode only)
-- `openssl` (only if using `password` in config)
 
 **Remote mode (target device):**
 - SSH access
@@ -87,7 +86,7 @@ wifi-country=FI
 |---|---|
 | `hostname` | Set system hostname |
 | `user` | Set username (renames the default UID 1000 user) |
-| `password` | Set user password (hashed locally with `openssl passwd -6`) |
+| `password` | Set user password (set via `chpasswd` on first boot) |
 | `ssh-key` | SSH public key file (repeatable; defaults to `~/.ssh/*.pub` if `user` is set) |
 | `wifi-ssid` | WiFi network name (requires `wifi-password`) |
 | `wifi-password` | WiFi password (requires `wifi-ssid`) |
