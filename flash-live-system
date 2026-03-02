@@ -630,12 +630,6 @@ fi
 
 echo "apply-customization: applying first-boot customization..."
 
-# Drop all page caches before interacting with the block device. After dd,
-# the kernel may still hold stale dirty pages from the old filesystem (ext4
-# journal, metadata). A loop mount + umount on the same block device can
-# trigger writeback of those stale pages, corrupting the new image.
-echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-
 # Mount via loop device at the correct offset from the NEW partition table.
 # After dd, the kernel still has stale partition nodes (old offsets/sizes)
 # and stale block cache from the old image. Using the partition node would

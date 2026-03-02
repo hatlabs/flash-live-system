@@ -57,8 +57,10 @@ jobs:
 
           CURRENT_VERSION=$(cat VERSION | tr -d '[:space:]')
 
-          # Find latest stable tag (v{upstream}+{revision}, no _pre suffix)
-          LATEST_STABLE_TAG=$(git tag -l 'v*' \
+          # Find latest published stable release (excludes drafts and pre-releases).
+          # Draft releases create git tags, so git tag -l alone is insufficient.
+          LATEST_STABLE_TAG=$(gh release list --exclude-drafts --exclude-pre-releases \
+            --json tagName --jq '.[].tagName' \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?\+[0-9]+$' \
             | sort -V | tail -1 || true)
 
