@@ -2,6 +2,34 @@
 
 Flash a Linux SBC — locally on the device itself or over the network. Transfers a disk image, overwrites the boot device, and reboots into the new image.
 
+## TL;DR
+
+```bash
+# Install flash-live-system
+sudo curl -Lo /usr/local/bin/flash-live-system \
+  https://github.com/hatlabs/flash-live-system/releases/latest/download/flash-live-system
+sudo chmod +x /usr/local/bin/flash-live-system
+
+# Download a Raspberry Pi OS image
+curl -Lo rpi-os.img.xz \
+  https://downloads.raspberrypi.com/raspios_arm64/images/raspios_arm64-2025-12-04/2025-12-04-raspios-trixie-arm64.img.xz
+
+# Create a config file
+cat > mydevice.conf <<'EOF'
+hostname=mydevice
+user=pi
+password=changeme
+wifi-ssid=MyNetwork
+wifi-password=MyWifiPass
+wifi-country=FI
+EOF
+
+# Flash (run on the device itself)
+sudo flash-live-system --config mydevice.conf rpi-os.img.xz
+```
+
+The device reboots into the new image with your hostname, user, and WiFi pre-configured. See below for remote mode, mode selection, and all config options.
+
 ## Prerequisites
 
 The script embeds a statically-linked busybox (arm64), so the target device does not need busybox, dd, xzcat, or zcat installed.
